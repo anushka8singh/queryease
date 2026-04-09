@@ -1,0 +1,52 @@
+{
+  "customer": [
+    {
+      "table": "customers",
+      "column": "customer_id",
+      "description": "Primary key for a customer record"
+    },
+    {
+      "table": "customers",
+      "column": "customer_name",
+      "description": "Display name of the customer"
+    }
+  ],
+  "order": [
+    {
+      "table": "orders",
+      "column": "order_id",
+      "description": "Primary key for an order"
+    },
+    {
+      "table": "orders",
+      "column": "order_date",
+      "description": "Date when the order was created"
+    }
+  ],
+  "revenue": [
+    {
+      "table": "orders",
+      "column": "total_amount",
+      "description": "Total monetary amount for an order"
+    }
+  ],
+  "sales": [
+    {
+      "table": "orders",
+      "column": "total_amount",
+      "description": "Common business label for order value"
+    }
+  ],
+  "employee": [
+    {
+      "table": "employees",
+      "column": "employee_id",
+      "description": "Primary key for an employee"
+    },
+    {
+      "table": "employees",
+      "column": "full_name",
+      "description": "Employee full name"
+    }
+  ]
+}

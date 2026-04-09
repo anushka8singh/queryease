@@ -1,14 +1,7 @@
-app.post("/query", async (req, res) => {
-    const userQuery = req.body.query;
+const app = require("./src/app");
 
-    const response = await fetch("http://127.0.0.1:8000/ai", {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json"
-        },
-        body: JSON.stringify({ query: userQuery })
-    });
+const port = Number(process.env.PORT || 3001);
 
-    const data = await response.json();
-    res.json(data);
+app.listen(port, () => {
+  console.log(`QueryEase backend listening on port ${port}`);
 });
