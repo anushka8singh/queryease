@@ -11,7 +11,7 @@ try:
     from .models import AgentState, QueryRequest, QueryResponse
     from .semantic_mapper import SemanticMapper
     from .sql_generator import SqlGenerator
-    from .validator import SqlValidator
+    from .validator import SqlValidator, detect_table_from_query, extract_tables_from_sql, validate_sql_tables
 except ImportError:  # pragma: no cover
     from config import Settings
     from db import Database
@@ -19,7 +19,7 @@ except ImportError:  # pragma: no cover
     from models import AgentState, QueryRequest, QueryResponse
     from semantic_mapper import SemanticMapper
     from sql_generator import SqlGenerator
-    from validator import SqlValidator
+    from validator import SqlValidator, detect_table_from_query, extract_tables_from_sql, validate_sql_tables
 
 
 class WorkflowNode(Protocol):
@@ -81,8 +81,10 @@ class InputNode:
                 },
             )
 
+        state.schema_tables = [str(table.get("table", "")) for table in state.schema_overview if table.get("table")]
         state.semantic_matches = self.context.semantic_mapper.match(state.query)
         state.semantic_summary = self.context.semantic_mapper.describe(state.semantic_matches)
+        state.table_hint = detect_table_from_query(state.query, state.schema_tables)
         state.next_node = SQLGeneratorNode.name
 
         logger.add(
@@ -90,6 +92,12 @@ class InputNode:
             "Schema loaded",
             table_count=len(state.schema_overview),
             semantic_matches=state.semantic_matches,
+        )
+        logger.add(
+            "table_detected",
+            f"Detected table: {state.table_hint or 'none'}",
+            detected_table=state.table_hint,
+            schema_tables=state.schema_tables,
         )
         return state
 
@@ -115,6 +123,8 @@ class SQLGeneratorNode:
             provider=state.provider,
             semantic_summary=state.semantic_summary,
             schema_overview=state.schema_overview,
+            schema_tables=state.schema_tables,
+            table_hint=state.table_hint,
             context=state.context,
         )
 
@@ -159,13 +169,19 @@ class ValidatorNode:
             state.validated_sql = self.context.validator.validate(
                 state.current_sql,
                 self.context.settings.max_result_rows,
+                state.schema_tables,
+                state.table_hint,
             )
+            extracted_tables = extract_tables_from_sql(state.validated_sql)
+            if not validate_sql_tables(state.validated_sql, state.schema_tables):
+                raise HTTPException(status_code=400, detail={"message": "Invalid table detected in SQL"})
             state.next_node = ExecutorNode.name
             logger.add(
                 "validation_passed",
                 "Validation passed",
                 attempt=state.attempts,
                 sql=state.validated_sql,
+                extracted_tables=extracted_tables,
             )
             return state
         except HTTPException as exc:
@@ -175,10 +191,11 @@ class ValidatorNode:
 
         logger.add(
             "validation_failed",
-            "Validation failed, attempting fix",
+            "SQL rejected due to invalid table" if "table" in state.last_error.lower() else "Validation failed, attempting fix",
             attempt=state.attempts,
             sql=state.current_sql,
             error=state.last_error,
+            table_hint=state.table_hint,
         )
 
         if not _has_feedback_retry_remaining(state):
@@ -187,7 +204,7 @@ class ValidatorNode:
 
         logger.add(
             "feedback_triggered",
-            "Feedback loop triggered",
+            "Regenerating SQL with correct table",
             attempt=state.attempts,
         )
 
@@ -225,6 +242,8 @@ class FixerNode:
             error_message=state.last_error,
             semantic_summary=state.semantic_summary,
             schema_overview=state.schema_overview,
+            schema_tables=state.schema_tables,
+            table_hint=state.table_hint,
             context=state.context,
         )
 
@@ -261,11 +280,27 @@ class ExecutorNode:
         self.context = context
 
     def run(self, state: AgentState, logger: QueryLogger) -> AgentState:
+        extracted_tables = extract_tables_from_sql(state.validated_sql)
+        allowed_tables = {table.lower() for table in state.schema_tables}
+        invalid_tables = [table for table in extracted_tables if table.lower() not in allowed_tables]
+        if invalid_tables:
+            state.last_error = f"Invalid table detected in SQL: {', '.join(invalid_tables)}"
+            logger.add(
+                "executor_rejected",
+                "SQL rejected due to invalid table",
+                attempt=state.attempts,
+                sql=state.validated_sql,
+                invalid_tables=invalid_tables,
+            )
+            state.next_node = "failed"
+            return state
+
         logger.add(
             "executor_node",
             "Executing validated SQL against the database.",
             attempt=state.attempts,
             sql=state.validated_sql,
+            extracted_tables=extracted_tables,
         )
 
         try:

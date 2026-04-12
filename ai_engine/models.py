@@ -51,8 +51,10 @@ class AgentState(BaseModel):
     context: dict[str, Any] = Field(default_factory=dict)
     provider: str
     schema_overview: list[dict[str, Any]] = Field(default_factory=list)
+    schema_tables: list[str] = Field(default_factory=list)
     semantic_matches: list[dict[str, Any]] = Field(default_factory=list)
     semantic_summary: str = ""
+    table_hint: str | None = None
     current_sql: str = ""
     validated_sql: str = ""
     result: list[dict[str, Any]] = Field(default_factory=list)

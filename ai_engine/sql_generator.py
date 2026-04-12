@@ -7,10 +7,12 @@ try:
     from .config import Settings, get_settings
     from .llm_client import SERVICE_FALLBACK_MESSAGE, call_llm
     from .models import SqlGenerationResult
+    from .prompts import SQL_REPAIR_PROMPT, SQL_SYSTEM_PROMPT
 except ImportError:  # pragma: no cover
     from config import Settings, get_settings
     from llm_client import SERVICE_FALLBACK_MESSAGE, call_llm
     from models import SqlGenerationResult
+    from prompts import SQL_REPAIR_PROMPT, SQL_SYSTEM_PROMPT
 
 
 class SqlGenerator:
@@ -25,6 +27,8 @@ class SqlGenerator:
         provider: str,
         semantic_summary: str,
         schema_overview: list[dict[str, Any]],
+        schema_tables: list[str],
+        table_hint: str | None,
         context: dict[str, Any],
     ) -> SqlGenerationResult:
         if provider.lower() == "rules":
@@ -32,9 +36,16 @@ class SqlGenerator:
                 user_query=user_query,
                 semantic_summary=semantic_summary,
                 schema_overview=schema_overview,
+                schema_tables=schema_tables,
+                table_hint=table_hint,
             )
 
-        cache_key = self._build_cache_key(user_query=user_query, context=context, semantic_summary=semantic_summary)
+        cache_key = self._build_cache_key(
+            user_query=user_query,
+            context=context,
+            semantic_summary=semantic_summary,
+            table_hint=table_hint,
+        )
         cached = self._sql_cache.get(cache_key)
         if cached is not None:
             return cached.model_copy(deep=True)
@@ -43,6 +54,7 @@ class SqlGenerator:
             sql = self.generate_sql(
                 query=user_query,
                 schema=schema_overview,
+                table_hint=table_hint,
             )
             result = SqlGenerationResult(
                 sql=sql,
@@ -56,15 +68,18 @@ class SqlGenerator:
                     user_query=user_query,
                     semantic_summary=semantic_summary,
                     schema_overview=schema_overview,
+                    schema_tables=schema_tables,
+                    table_hint=table_hint,
                 )
                 fallback.assumptions.append("Gemini quota was exceeded, so QueryEase used its local fallback generator.")
                 return fallback
             raise
 
-    def generate_sql(self, query: str, schema: list[dict[str, Any]]) -> str:
+    def generate_sql(self, query: str, schema: list[dict[str, Any]], table_hint: str | None = None) -> str:
         prompt = self._build_generate_prompt(
             query=query,
             schema=schema,
+            table_hint=table_hint,
         )
         return self._normalize_sql(call_llm(prompt, settings=self.settings))
 
@@ -77,6 +92,8 @@ class SqlGenerator:
         error_message: str,
         semantic_summary: str,
         schema_overview: list[dict[str, Any]],
+        schema_tables: list[str],
+        table_hint: str | None,
         context: dict[str, Any],
     ) -> SqlGenerationResult:
         if provider.lower() == "rules":
@@ -86,6 +103,8 @@ class SqlGenerator:
                 error_message=error_message,
                 semantic_summary=semantic_summary,
                 schema_overview=schema_overview,
+                schema_tables=schema_tables,
+                table_hint=table_hint,
             )
 
         prompt = self._build_repair_prompt(
@@ -95,6 +114,7 @@ class SqlGenerator:
             context=context,
             semantic_summary=semantic_summary,
             schema_overview=schema_overview,
+            table_hint=table_hint,
         )
         try:
             sql = self._normalize_sql(call_llm(prompt, settings=self.settings))
@@ -110,6 +130,8 @@ class SqlGenerator:
                     error_message=error_message,
                     semantic_summary=semantic_summary,
                     schema_overview=schema_overview,
+                    schema_tables=schema_tables,
+                    table_hint=table_hint,
                 )
                 fallback.assumptions.append("Gemini quota was exceeded during repair, so QueryEase used its local fallback repair.")
                 return fallback
@@ -145,22 +167,18 @@ class SqlGenerator:
         *,
         query: str,
         schema: list[dict[str, Any]],
+        table_hint: str | None,
     ) -> str:
         compact_query = query.strip()[: self.settings.max_query_length]
         formatted_schema = self._format_schema(schema)
+        hint_line = table_hint or "none"
         return (
-            "ROLE:\n"
-            "You are an expert SQL generator.\n\n"
+            f"{SQL_SYSTEM_PROMPT}\n\n"
             "CONTEXT:\n"
             f"Database schema:\n{formatted_schema}\n\n"
+            f"User likely refers to table: {hint_line}\n\n"
             "USER QUERY:\n"
             f"{compact_query}\n\n"
-            "INSTRUCTIONS:\n"
-            "- Generate valid MySQL SQL\n"
-            "- Use ONLY tables and columns from schema\n"
-            "- Add LIMIT 200 if not specified\n"
-            "- Do NOT hallucinate\n"
-            "- Do NOT explain anything\n\n"
             "OUTPUT:\n"
             "Return ONLY SQL query"
         )
@@ -174,10 +192,16 @@ class SqlGenerator:
         context: dict[str, Any],
         semantic_summary: str,
         schema_overview: list[dict[str, Any]],
+        table_hint: str | None,
     ) -> str:
         compact_query = user_query.strip()[: self.settings.max_query_length]
         compact_error = " ".join(error_message.split())[:300]
+        hint_line = table_hint or "none"
         return (
+            f"{SQL_REPAIR_PROMPT}\n\n"
+            f"User likely refers to table: {hint_line}\n\n"
+            "Original user request:\n"
+            f"{compact_query}\n\n"
             "You generated this SQL:\n"
             f"{failed_sql}\n\n"
             "Issue:\n"
@@ -226,9 +250,16 @@ class SqlGenerator:
         user_query: str,
         semantic_summary: str,
         schema_overview: list[dict[str, Any]],
+        schema_tables: list[str],
+        table_hint: str | None,
     ) -> SqlGenerationResult:
         lowered = user_query.lower()
-        table_name = self._extract_table_name(semantic_summary, schema_overview)
+        table_name = self._resolve_fallback_table(
+            table_hint=table_hint,
+            semantic_summary=semantic_summary,
+            schema_overview=schema_overview,
+            schema_tables=schema_tables,
+        )
         if "count" in lowered or "how many" in lowered:
             sql = f"SELECT COUNT(*) AS total_rows FROM {table_name}"
             assumptions = ["Used a count query because the request asked for totals."]
@@ -249,16 +280,52 @@ class SqlGenerator:
         error_message: str,
         semantic_summary: str,
         schema_overview: list[dict[str, Any]],
+        schema_tables: list[str],
+        table_hint: str | None,
     ) -> SqlGenerationResult:
-        table_name = self._extract_table_name(semantic_summary, schema_overview)
-        if "doesn't exist" in error_message.lower() or "unknown column" in error_message.lower():
+        table_name = self._resolve_fallback_table(
+            table_hint=table_hint,
+            semantic_summary=semantic_summary,
+            schema_overview=schema_overview,
+            schema_tables=schema_tables,
+        )
+        if (
+            table_hint
+            or "doesn't exist" in error_message.lower()
+            or "unknown column" in error_message.lower()
+            or "invalid table" in error_message.lower()
+            or "expected sql to use detected table" in error_message.lower()
+        ):
             sql = f"SELECT * FROM {table_name} LIMIT 200"
-            assumptions = ["Fell back to a basic table sample because the previous query referenced missing fields."]
+            assumptions = ["Fell back to a basic table sample using the enforced table selection."]
         else:
             sql = failed_sql
             assumptions = [f"Rules provider could not improve the query beyond the last attempt for: {user_query}"]
 
         return SqlGenerationResult(sql=sql, assumptions=assumptions)
+
+    def _resolve_fallback_table(
+        self,
+        *,
+        table_hint: str | None,
+        semantic_summary: str,
+        schema_overview: list[dict[str, Any]],
+        schema_tables: list[str],
+    ) -> str:
+        if table_hint:
+            return table_hint
+
+        semantic_table = self._extract_table_name(semantic_summary, schema_overview)
+        if semantic_table in schema_tables:
+            return semantic_table
+
+        if schema_tables:
+            return schema_tables[0]
+
+        raise HTTPException(
+            status_code=422,
+            detail={"message": "No table metadata was available to generate a safe SQL query."},
+        )
 
     def _extract_table_name(self, semantic_summary: str, schema_overview: list[dict[str, Any]]) -> str:
         for line in semantic_summary.splitlines():
@@ -278,6 +345,7 @@ class SqlGenerator:
         user_query: str,
         context: dict[str, Any],
         semantic_summary: str,
+        table_hint: str | None,
     ) -> str:
         context_key = json.dumps(context, sort_keys=True, default=str)
-        return f"{user_query.strip().lower()}|{semantic_summary}|{context_key}"
+        return f"{user_query.strip().lower()}|{semantic_summary}|{table_hint or 'none'}|{context_key}"
